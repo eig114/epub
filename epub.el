@@ -13,13 +13,17 @@
 
 (defvar epub--debug nil)
 
+(defconst epub-render-buffer "*epub*"
+  "Buffer to display rendered pages.")
+
+(defconst epub-toc-buffer "*epub-toc*"
+  "Default buffer to display table of contents.")
+
 (defvar epub--archive-cache nil
   "Contains xml and page content cache as alist in format
 ((ARCHIVE-PATH . ((CONTENT-PATH . VALUE)
                   ...))
  ...)")
-
-(defvar-local archive-file nil)
 
 (defsubst cadr-safe (x)
   "Return the safe car of the cdr of X."
@@ -34,50 +38,69 @@
   (car-safe (cdr-safe (cdr-safe x))))
 
 (defun epub--show-toc (archive &optional buffer)
+  "Assuming ARCHIVE is a valid epub file, switch to BUFFER and render table of contents there."
   (let* ((rootfile (epub--locate-rootfile archive))
-         (ncx-file (epub--locate-ncx archive rootfile))
+	 (dom (epub--archive-get-xml archive rootfile))
+	 (manifest-idx (epub--manifest-idx dom))
+	 (spine-toc-idx (epub--spine-toc-idx dom manifest-idx))
+         (ncx-file (epub--locate-ncx dom rootfile))
          (ncx-path (file-name-directory (or ncx-file "")))
          (ncx (epub--archive-get-xml archive ncx-file))
          (title (caddr-safe (epub--xml-node ncx 'docTitle 'text)))
          (navmap (epub--xml-node ncx 'navMap))
-         (buf (get-buffer-create (or buffer "TOC")))
+         (buf (get-buffer-create (or buffer epub-toc-buffer)))
          start)
     (pop-to-buffer-same-window buf)
     (indented-text-mode)
     (erase-buffer)
-    (insert title "\n\n")
-    (epub--insert-navmap navmap archive ncx-path)
+    (insert title "\n\nTable of contents\n\n")
+    (epub--insert-navmap navmap archive ncx-path spine-toc-idx)
     (insert "\n\n")
     (if epub--debug (epub--insert-xml archive ncx-file))
     (goto-char (point-min))
     (set-buffer-modified-p nil)
-    (setq buffer-read-only t)
-    (setq archive-file archive)))
+    (setq buffer-read-only t)))
 
+
+(defun epub--spine-toc-idx (dom manifest-idx)
+  "Create table-of-contents hashtable, with key as page href, 
+and value as pair (previous-page-href . next-page-href)"
+  (when epub--debug
+    (message "epub.el: Building href navigation index"))
+  (let* ((spine-root (epub--xml-node dom 'spine))
+	 (toc-id (epub--xml-prop spine-root 'toc))
+	 (spine-items (cddr-safe spine-root))
+	 (hashtable (make-hash-table :test #'equal)))
+    (cl-loop for items = spine-items then (cdr items)
+	     for prev-item = nil then item-id
+	     for item = (car items)
+	     for item-id = (epub--xml-prop item 'idref)
+	     until (null items) 
+	     if (not (string= item-id toc-id)) ;; skip toc
+	     do (puthash (gethash item-id manifest-idx)                                            ;; this href
+			 (cons (gethash prev-item manifest-idx)                                    ;; prev href
+			       (gethash (epub--xml-prop (cadr-safe items) 'idref) manifest-idx))   ;; next href
+			 hashtable))
+    hashtable))
+
+(defun epub--manifest-idx (dom)
+  "Create manifest hash table with key being id, value being href"
+  ;;(message "epub.el: Building manifest index")
+  (let ((manifest (cddr-safe (epub--xml-node dom 'manifest)))
+	(new-idx (make-hash-table :test #'equal)))
+    (loop for item in (cdr manifest)
+	  do (puthash (epub--xml-prop item 'id) (epub--xml-prop item 'href) new-idx))
+    new-idx))
+
+  
 (defun epub--insert-xml (archive name &optional no-pretty-print)
   (let ((start (point-marker)))
     (when epub--debug
-      (message "Extracting %S, looking for %S" archive name))
+      (message "epub.el: Extracting %S, looking for %S" archive name))
     (archive-zip-extract archive name)
     (decode-coding-inserted-region start (point) name)
     (unless no-pretty-print
       (epub--pretty-print-xml start (point)))))
-
-(defun epub--create-navpoint-handler (archive node-path buffer)
-  (let* ((split-node (split-string node-path "#"))
-         (arc-path (car split-node))
-         (html-path (cadr split-node)))
-    (lambda (unused-param)
-      (switch-to-buffer (get-buffer-create buffer))
-      (let ((dom (epub--archive-get-dom archive arc-path)))
-        (erase-buffer)
-        (shr-insert-document dom)
-        (goto-char (point-min)))
-      ;;  (let ((rendered (epub--archive-get-rendered-page archive arc-path)))
-      ;;    (erase-buffer)
-      ;;    (insert rendered)
-      ;;    (goto-char (point-min)))
-      )))
 
 ;;; BIG UGLY HACK - REDEFINING shr-image-fetched
 (eval-after-load "shr"
@@ -92,25 +115,59 @@
        (funcall shr-image-fetched-original
                 status buffer start end flags))))
 
-(defun epub--insert-navpoint (navpoint ncx-path archive &optional ident-str)
+(defun epub--create-navpoint-handler (archive ncx-path navpoint-content spine-toc-idx)
+  "Create handler for navigation buttons"
+  (let* ((node-path (concat ncx-path navpoint-content))
+	 (split-node (split-string node-path "#"))
+         (arc-path (car split-node))
+         (html-path (cadr split-node)))
+    (lambda (_)
+      (switch-to-buffer (get-buffer-create epub-render-buffer))
+      ;;todo figure out a reliable way to display human-readable name
+      (let ((dom (epub--archive-get-dom archive arc-path)))
+        (erase-buffer)
+        (shr-insert-document dom)
+	(let ((prev-next (gethash navpoint-content spine-toc-idx)))
+	  ;; insert navigation buttons
+	  (when (car prev-next)
+	    (insert "\n")
+	    (insert-text-button
+	     "Previous page"
+	     'action (epub--create-navpoint-handler archive ncx-path (car prev-next) spine-toc-idx)
+	     'follow-link t))
+	  (when (cdr prev-next)
+	    (insert "\n")
+	    (insert-text-button
+	     "Next page"
+	     'action (epub--create-navpoint-handler archive ncx-path (cdr prev-next) spine-toc-idx)
+	     'follow-link t)))
+        (goto-char (point-min)))
+      ;;  (let ((rendered (epub--archive-get-rendered-page archive arc-path)))
+      ;;    (erase-buffer)
+      ;;    (insert rendered)
+      ;;    (goto-char (point-min)))
+      )))
+
+(defun epub--insert-navpoint (navpoint ncx-path archive spine-toc-idx &optional ident-str)
+  "Inserts navigation button in TOC buffer"
   (let ((navpoint-content (epub--xml-prop (epub--xml-node navpoint 'content) 'src))
-        (text (caddr-safe (epub--xml-node navpoint 'navLabel 'text)))
+        (text (caddr-safe (epub--xml-node navpoint 'navLabel 'text))) 
         (point-start (point)))
     (when ident-str (insert ident-str)) 
     (insert text)
     (make-text-button
      point-start (point)
-     'action (epub--create-navpoint-handler
-              archive (concat ncx-path navpoint-content) text)
-     'follow-link t)                                               
+     'action (epub--create-navpoint-handler archive ncx-path navpoint-content spine-toc-idx)
+     'follow-link t)
     (insert "\n")))
 
-(defun epub--insert-navmap (navmap archive ncx-path &optional ident-str)
+(defun epub--insert-navmap (navmap archive ncx-path spine-toc-idx &optional ident-str)
+  "Inserts navigation buttons in TOC buffer"
   (cl-loop for navpoint in navmap
            when (epub--xml-node navpoint 'navLabel 'text)
            do
-           (epub--insert-navpoint navpoint ncx-path archive ident-str)
-           (epub--insert-navmap navpoint archive ncx-path (concat ident-str "  "))))
+           (epub--insert-navpoint navpoint ncx-path archive spine-toc-idx ident-str)
+           (epub--insert-navmap navpoint archive ncx-path spine-toc-idx (concat ident-str "  "))))
 
 (defun epub--pretty-print-xml (&optional begin end)
   (interactive (and (use-region-p) (list (region-beginning) (region-end))))
@@ -129,9 +186,9 @@
       (error "Unable to locate epub document root file"))
     full-path))
 
-(defun epub--locate-ncx (archive rootfile)
-  (let* ((dom (epub--archive-get-xml archive rootfile))
-         (manifest (epub--xml-node dom 'manifest))
+(defun epub--locate-ncx (dom rootfile)
+  "Locate and return relative path for navigation control file"
+  (let* ((manifest (epub--xml-node dom 'manifest))
          (ncx
           (cl-loop for item in (cddr-safe manifest)
                    when (and
@@ -183,7 +240,7 @@
                      (epub--convert-links archive
                                           (libxml-parse-html-region (point-min)
                                                                     (point-max))
-										  (file-name-directory name)))))
+					  (file-name-directory name)))))
     (epub--fill-cache archive name dom-cache)))
 
 (defun epub--archive-get-dom (archive name)
@@ -214,25 +271,23 @@ Mapper must accept a cons cell and return updated cons cell"
 with links to temporary files. Returns updated DOM"
   (epub--map-alist dom
                    (lambda (x)
-                     (if (and (eq (car x) 'src)
+                     (if (and (or (eq (car x) 'src) (eq (car x) 'href))
                               (not (string-match "^[[:alpha:]]+[[:alnum:]+-.]*://"  ; assume URL is anything that starts with proper scheme name followed by ://
                                                  (cdr x))))
-						 (cons 'src
-							   (epub--extract-link archive
-												   (concat link-root (cdr x))))
+			 (cons 'src (epub--extract-link archive (concat link-root (cdr x))))
                        x))))
 
 (defun epub--fill-render-cache (archive name)
   (let ((rendered
          (with-temp-buffer
            (when epub--debug
-             (message "Extracting %S, looking for %S" archive name))
+             (message "epub.el: Extracting %S, looking for %S" archive name))
            (archive-zip-extract archive name)
            (let ((dom
                   (epub--convert-links archive
                                        (libxml-parse-html-region (point-min)
                                                                  (point-max))
-									   (file-name-directory name))))
+				       (file-name-directory name))))
              (erase-buffer)
              (shr-insert-document dom)
              (buffer-substring (point-min) (point-max))))))
