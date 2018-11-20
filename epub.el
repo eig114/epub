@@ -3,6 +3,7 @@
 (require 'arc-mode)
 
 (defun epub-mode ()
+  "Major mode for viewing .epub files"
   (interactive)
   (let* ((archive buffer-file-name)
          (name (file-name-sans-extension (file-name-nondirectory archive)))
@@ -10,6 +11,22 @@
     (unless epub--debug
       (kill-buffer))
     (epub--show-toc archive toc)))
+
+(defun epub-goto-page (context page)
+  "Go to page in epub file."
+  (interactive (list
+	        (or (and (boundp 'epub--current-context) epub--current-context)
+		    (let ((arc-name (completing-read "Which opened epub? "
+						     epub--context-hash-table
+						     nil
+						     t)))
+		      (gethash arc-name epub--context-hash-table)))
+	        (string-to-number (read-from-minibuffer "Page number: " "1"))))
+  (let ((page-href (gethash page
+			    (epub-context-pagenum-idx context))))
+    (switch-to-buffer (get-buffer-create epub-render-buffer))
+    (setq-local epub--current-context context)
+    (epub--render-page page-href context)))
 
 (defvar epub--debug nil)
 
@@ -25,6 +42,12 @@
                   ...))
  ...)")
 
+(defvar epub--context-hash-table (make-hash-table :test #'equal)
+  "Hash table with key being full path to archive, value being associated `epub-context'")
+
+(defvar-local epub--current-context nil
+  "Buffer-local variable containing associated `epub-context'")
+
 (defsubst cadr-safe (x)
   "Return the safe car of the cdr of X."
   (car-safe (cdr-safe x)))
@@ -37,51 +60,68 @@
   "Return the safe car of the cdr of the cdr of X."
   (car-safe (cdr-safe (cdr-safe x))))
 
+(cl-defstruct epub-context
+  archive
+  ncx-path
+  href-idx
+  pagenum-idx)
+
 (defun epub--show-toc (archive &optional buffer)
   "Assuming ARCHIVE is a valid epub file, switch to BUFFER and render table of contents there."
   (let* ((rootfile (epub--locate-rootfile archive))
 	 (dom (epub--archive-get-xml archive rootfile))
 	 (manifest-idx (epub--manifest-idx dom))
-	 (spine-toc-idx (epub--spine-toc-idx dom manifest-idx))
+	 (spine-toc-indeces (epub--spine-toc-idx dom manifest-idx))
          (ncx-file (epub--locate-ncx dom rootfile))
          (ncx-path (file-name-directory (or ncx-file "")))
          (ncx (epub--archive-get-xml archive ncx-file))
          (title (caddr-safe (epub--xml-node ncx 'docTitle 'text)))
          (navmap (epub--xml-node ncx 'navMap))
          (buf (get-buffer-create (or buffer epub-toc-buffer)))
-         start)
+	 (context (make-epub-context
+			:archive archive
+			:ncx-path ncx-path
+			:href-idx (car spine-toc-indeces)
+			:pagenum-idx (cdr spine-toc-indeces))))
+    (puthash archive context epub--context-hash-table)
     (pop-to-buffer-same-window buf)
     (indented-text-mode)
     (erase-buffer)
     (insert title "\n\nTable of contents\n\n")
-    (epub--insert-navmap navmap archive ncx-path spine-toc-idx)
+    (epub--insert-navmap navmap context)
     (insert "\n\n")
     (if epub--debug (epub--insert-xml archive ncx-file))
     (goto-char (point-min))
     (set-buffer-modified-p nil)
+    (setq epub--current-context context)
     (setq buffer-read-only t)))
-
 
 (defun epub--spine-toc-idx (dom manifest-idx)
   "Create table-of-contents hashtable, with key as page href, 
 and value as pair (previous-page-href . next-page-href)"
   (when epub--debug
-    (message "epub.el: Building href navigation index"))
+    (message "epub.el: Building href navigation indeces"))
   (let* ((spine-root (epub--xml-node dom 'spine))
 	 (toc-id (epub--xml-prop spine-root 'toc))
 	 (spine-items (cddr-safe spine-root))
-	 (hashtable (make-hash-table :test #'equal)))
+	 (href-idx (make-hash-table :test #'equal))
+	 (pagenum-idx (make-hash-table :test #'equal)))
     (cl-loop for items = spine-items then (cdr items)
-	     for prev-item = nil then item-id
-	     for item = (car items)
-	     for item-id = (epub--xml-prop item 'idref)
+	     for prev-href = nil then (gethash item-id manifest-idx)
+	     for next-href = (gethash (epub--xml-prop (cadr-safe items) 'idref) manifest-idx)
+	     for item-id = (epub--xml-prop (car items) 'idref)
+	     for this-href = (gethash item-id manifest-idx)
+	     for pagenum = 1 then (1+ pagenum)
 	     until (null items) 
 	     if (not (string= item-id toc-id)) ;; skip toc
-	     do (puthash (gethash item-id manifest-idx)                                            ;; this href
-			 (cons (gethash prev-item manifest-idx)                                    ;; prev href
-			       (gethash (epub--xml-prop (cadr-safe items) 'idref) manifest-idx))   ;; next href
-			 hashtable))
-    hashtable))
+	     do (progn
+		  (puthash this-href (cons prev-href next-href)
+			   href-idx)
+		  (puthash this-href pagenum
+			   pagenum-idx)
+		  (puthash pagenum this-href
+			   pagenum-idx)))
+    (cons href-idx pagenum-idx)))
 
 (defun epub--manifest-idx (dom)
   "Create manifest hash table with key being id, value being href"
@@ -102,53 +142,46 @@ and value as pair (previous-page-href . next-page-href)"
     (unless no-pretty-print
       (epub--pretty-print-xml start (point)))))
 
-;;; BIG UGLY HACK - REDEFINING shr-image-fetched
-(eval-after-load "shr"
-  '(progn
-     (defvar shr-image-fetched-original
-       (symbol-function 'shr-image-fetched))
-
-     (defun shr-image-fetched (status buffer start end &optional flags)
-       ;; For some reason shr-image-fetched expects to be in the beginnig of
-       ;; the buffer containing image, and isn't. So let's move it manually
-       (goto-char (point-min))
-       (funcall shr-image-fetched-original
-                status buffer start end flags))))
-
-(defun epub--create-navpoint-handler (archive ncx-path navpoint-content spine-toc-idx)
+(defun epub--create-navpoint-handler (archive-context page-href)
   "Create handler for navigation buttons"
-  (let* ((node-path (concat ncx-path navpoint-content))
-	 (split-node (split-string node-path "#"))
-         (arc-path (car split-node))
-         (html-path (cadr split-node)))
-    (lambda (_)
-      (switch-to-buffer (get-buffer-create epub-render-buffer))
-      ;;todo figure out a reliable way to display human-readable name
-      (let ((dom (epub--archive-get-dom archive arc-path)))
-        (erase-buffer)
-        (shr-insert-document dom)
-	(let ((prev-next (gethash navpoint-content spine-toc-idx)))
-	  ;; insert navigation buttons
-	  (when (car prev-next)
-	    (insert "\n")
-	    (insert-text-button
-	     "Previous page"
-	     'action (epub--create-navpoint-handler archive ncx-path (car prev-next) spine-toc-idx)
-	     'follow-link t))
-	  (when (cdr prev-next)
-	    (insert "\n")
-	    (insert-text-button
-	     "Next page"
-	     'action (epub--create-navpoint-handler archive ncx-path (cdr prev-next) spine-toc-idx)
-	     'follow-link t)))
-        (goto-char (point-min)))
-      ;;  (let ((rendered (epub--archive-get-rendered-page archive arc-path)))
-      ;;    (erase-buffer)
-      ;;    (insert rendered)
-      ;;    (goto-char (point-min)))
-      )))
+  (lambda (_)
+    (switch-to-buffer (get-buffer-create epub-render-buffer))
+    (setq-local epub--current-context archive-context)
+    (epub--render-page page-href archive-context)))
 
-(defun epub--insert-navpoint (navpoint ncx-path archive spine-toc-idx &optional ident-str)
+(defun epub--render-page (page-href archive-context)
+  "Renders page PAGE-HREF from ARCHIVE-CONTEXT"
+  (view-mode 0)
+  ;;todo figure out a reliable way to display human-readable name without creating new buffer
+  (let* ((href-idx (epub-context-href-idx archive-context))
+	(pagenum-idx (epub-context-pagenum-idx archive-context))
+	(node-path (concat (epub-context-ncx-path archive-context) page-href))
+	(split-node (split-string node-path "#"))
+        (arc-path (car split-node))
+	(prev-next (gethash page-href href-idx))
+	(pagenum (gethash page-href pagenum-idx))
+	(dom (epub--archive-get-dom (epub-context-archive archive-context) arc-path)))
+    (erase-buffer)
+    (shr-insert-document dom)
+    (insert (format "\nPage %d" pagenum))
+    ;; insert navigation buttons
+    (when (car prev-next)
+      (insert "\n")
+      (insert-text-button
+       "Previous page"
+       'action (epub--create-navpoint-handler archive-context (car prev-next))
+       'follow-link t))
+    (when (cdr prev-next)
+      (insert "\n")
+      (insert-text-button
+       "Next page"
+       'action (epub--create-navpoint-handler archive-context (cdr prev-next))
+       'follow-link t)))
+  (goto-char (point-min))
+  (view-mode 1))
+
+  
+(defun epub--insert-navpoint (navpoint archive-context &optional ident-str)
   "Inserts navigation button in TOC buffer"
   (let ((navpoint-content (epub--xml-prop (epub--xml-node navpoint 'content) 'src))
         (text (caddr-safe (epub--xml-node navpoint 'navLabel 'text))) 
@@ -157,17 +190,17 @@ and value as pair (previous-page-href . next-page-href)"
     (insert text)
     (make-text-button
      point-start (point)
-     'action (epub--create-navpoint-handler archive ncx-path navpoint-content spine-toc-idx)
+     'action (epub--create-navpoint-handler archive-context navpoint-content)
      'follow-link t)
     (insert "\n")))
 
-(defun epub--insert-navmap (navmap archive ncx-path spine-toc-idx &optional ident-str)
+(defun epub--insert-navmap (navmap context &optional ident-str)
   "Inserts navigation buttons in TOC buffer"
   (cl-loop for navpoint in navmap
            when (epub--xml-node navpoint 'navLabel 'text)
            do
-           (epub--insert-navpoint navpoint ncx-path archive spine-toc-idx ident-str)
-           (epub--insert-navmap navpoint archive ncx-path spine-toc-idx (concat ident-str "  "))))
+           (epub--insert-navpoint navpoint context ident-str)
+           (epub--insert-navmap navpoint context (concat ident-str "  "))))
 
 (defun epub--pretty-print-xml (&optional begin end)
   (interactive (and (use-region-p) (list (region-beginning) (region-end))))
