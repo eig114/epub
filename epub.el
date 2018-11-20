@@ -24,6 +24,8 @@
 	        (string-to-number (read-from-minibuffer "Page number: " "1"))))
   (let ((page-href (gethash page
 			    (epub-context-pagenum-idx context))))
+    (unless page-href
+      (error "Page not found"))
     (switch-to-buffer (get-buffer-create epub-render-buffer))
     (setq-local epub--current-context context)
     (epub--render-page page-href context)))
@@ -93,7 +95,7 @@
     (if epub--debug (epub--insert-xml archive ncx-file))
     (goto-char (point-min))
     (set-buffer-modified-p nil)
-    (setq epub--current-context context)
+    (setq-local epub--current-context context)
     (setq buffer-read-only t)))
 
 (defun epub--spine-toc-idx (dom manifest-idx)
@@ -162,22 +164,22 @@ and value as pair (previous-page-href . next-page-href)"
 	(pagenum (gethash page-href pagenum-idx))
 	(dom (epub--archive-get-dom (epub-context-archive archive-context) arc-path)))
     (erase-buffer)
-    (shr-insert-document dom)
-    (insert (format "\nPage %d" pagenum))
+    (insert (format "Page %d\n" pagenum))
     ;; insert navigation buttons
     (when (car prev-next)
-      (insert "\n")
       (insert-text-button
        "Previous page"
        'action (epub--create-navpoint-handler archive-context (car prev-next))
-       'follow-link t))
+       'follow-link t)
+      (insert "\n"))
     (when (cdr prev-next)
-      (insert "\n")
       (insert-text-button
        "Next page"
        'action (epub--create-navpoint-handler archive-context (cdr prev-next))
-       'follow-link t)))
-  (goto-char (point-min))
+       'follow-link t)
+      (insert "\n"))
+    (shr-insert-document dom)
+    (goto-char (point-min)))
   (view-mode 1))
 
   
@@ -291,7 +293,7 @@ Mapper must accept a cons cell and return updated cons cell"
 
 (defun epub--extract-link (archive link)
   "From ARCHIVE, extract file at relative path LINK and return url for extracted"
-  (let ((tmp-file (make-temp-file "epub-src"
+  (let ((tmp-file (make-temp-file "epub-src" ;;todo delete temp file later
                                   nil
                                   (file-name-extension link t))))
     (with-temp-file tmp-file
