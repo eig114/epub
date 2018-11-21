@@ -38,11 +38,9 @@
 (defconst epub-toc-buffer "*epub-toc*"
   "Default buffer to display table of contents.")
 
-(defvar epub--archive-cache nil
-  "Contains xml and page content cache as alist in format
-((ARCHIVE-PATH . ((CONTENT-PATH . VALUE)
-                  ...))
- ...)")
+(defvar epub--archive-cache (make-hash-table :test #'equal)
+  "Hash table with key being full archive path and value being another hash table, 
+with key being content path and value being content DOM model")
 
 (defvar epub--context-hash-table (make-hash-table :test #'equal)
   "Hash table with key being full path to archive, value being associated `epub-context'")
@@ -166,16 +164,16 @@ and value as pair (previous-page-href . next-page-href)"
     (erase-buffer)
     (insert (format "Page %d\n" pagenum))
     ;; insert navigation buttons
-    (when (car prev-next)
-      (insert-text-button
-       "Previous page"
-       'action (epub--create-navpoint-handler archive-context (car prev-next))
-       'follow-link t)
-      (insert "\n"))
     (when (cdr prev-next)
       (insert-text-button
        "Next page"
        'action (epub--create-navpoint-handler archive-context (cdr prev-next))
+       'follow-link t)
+      (insert "\n"))
+    (when (car prev-next)
+      (insert-text-button
+       "Previous page"
+       'action (epub--create-navpoint-handler archive-context (car prev-next))
        'follow-link t)
       (insert "\n"))
     (shr-insert-document dom)
@@ -254,16 +252,14 @@ and value as pair (previous-page-href . next-page-href)"
   (concat (or (file-name-directory (or relative-to "")) "") name))
 
 (defun epub--fill-cache (archive name value)
-  (push (cons name value)
-        (cdr (assoc archive epub--archive-cache)))
+  (puthash name value (gethash archive epub--archive-cache))
   value)
 
 (defun epub--get-cached(archive name &optional cache-fill-func)
-  (let ((arc-cache (cdr (assoc archive epub--archive-cache))))
+  (let ((arc-cache (gethash archive epub--archive-cache)))
     (unless arc-cache
-      (push (cons archive nil)
-            epub--archive-cache))
-    (let ((cache (cdr (assoc name arc-cache))))
+      (setq arc-cache (puthash archive (make-hash-table :test #'equal) epub--archive-cache)))
+    (let ((cache (gethash name arc-cache)))
       (when (and (not cache)
                  cache-fill-func)
         (setq cache (funcall cache-fill-func archive name)))
