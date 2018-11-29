@@ -30,6 +30,21 @@
     (setq-local epub--current-context context)
     (epub--render-page page-href context)))
 
+(defun epub-next-page ()
+  "Go to next page of currently opened epub"
+  (interactive)
+  (when (and (boundp 'epub--current-context) epub--current-context
+	     (boundp 'epub--current-pagenum) epub--current-pagenum)
+    (epub-goto-page epub--current-context (1+ epub--current-pagenum))))
+
+(defun epub-prev-page ()
+  "Go to previous page of currently opened epub"
+  (interactive)
+  (when (and (boundp 'epub--current-context) epub--current-context
+	     (boundp 'epub--current-pagenum) epub--current-pagenum)
+    (epub-goto-page epub--current-context (1- epub--current-pagenum))))
+
+
 (defvar epub--debug nil)
 
 (defconst epub-render-buffer "*epub*"
@@ -47,6 +62,16 @@ with key being content path and value being content DOM model")
 
 (defvar-local epub--current-context nil
   "Buffer-local variable containing associated `epub-context'")
+
+(defvar-local epub--current-pagenum 0
+  "Buffer-local variable containing current page number")
+
+(defconst epub-keymap
+  (let ((keymap (make-keymap)))
+    (define-key keymap (kbd "M-<up>") #'epub-prev-page)
+    (define-key keymap (kbd "M-<down>") #'epub-next-page)
+    keymap)
+  "Keymap for `epub-mode'.")
 
 (defsubst cadr-safe (x)
   "Return the safe car of the cdr of X."
@@ -94,6 +119,7 @@ with key being content path and value being content DOM model")
     (goto-char (point-min))
     (set-buffer-modified-p nil)
     (setq-local epub--current-context context)
+    (setq-local epub--current-pagenum 0)
     (setq buffer-read-only t)))
 
 (defun epub--spine-toc-idx (dom manifest-idx)
@@ -161,6 +187,7 @@ and value as pair (previous-page-href . next-page-href)"
 	(prev-next (gethash page-href href-idx))
 	(pagenum (gethash page-href pagenum-idx))
 	(dom (epub--archive-get-dom (epub-context-archive archive-context) arc-path)))
+    (setq-local epub--current-pagenum pagenum)
     (erase-buffer)
     (insert (format "Page %d\n" pagenum))
     ;; insert navigation buttons
@@ -178,7 +205,8 @@ and value as pair (previous-page-href . next-page-href)"
       (insert "\n"))
     (shr-insert-document dom)
     (goto-char (point-min)))
-  (view-mode 1))
+  (view-mode 1)
+  (use-local-map epub-keymap))
 
   
 (defun epub--insert-navpoint (navpoint archive-context &optional ident-str)
@@ -256,14 +284,14 @@ and value as pair (previous-page-href . next-page-href)"
   value)
 
 (defun epub--get-cached(archive name &optional cache-fill-func)
-  (let ((arc-cache (gethash archive epub--archive-cache)))
-    (unless arc-cache
-      (setq arc-cache (puthash archive (make-hash-table :test #'equal) epub--archive-cache)))
-    (let ((cache (gethash name arc-cache)))
-      (when (and (not cache)
-                 cache-fill-func)
-        (setq cache (funcall cache-fill-func archive name)))
-      cache)))
+  (let* ((arc-cache
+	  (or (gethash archive epub--archive-cache)
+	      (puthash archive (make-hash-table :test #'equal) epub--archive-cache)))
+	 (cache (gethash name arc-cache)))
+    (when (and (not cache)
+               cache-fill-func)
+      (setq cache (funcall cache-fill-func archive name)))
+    cache))
 
 (defun epub--fill-dom-cache (archive name)
   (let ((dom-cache (with-temp-buffer
